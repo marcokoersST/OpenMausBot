@@ -65,7 +65,8 @@ services:
     environment:
       DOMAIN: ${DOMAIN}
     volumes:
-      - ../Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./status:/srv/status:ro
       - caddy_data:/data
       - caddy_config:/config
 

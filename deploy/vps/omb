@@ -7,6 +7,8 @@ REPO_DIR="$(cd "$VPS_DIR/../.." && pwd)"
 ENV_FILE="$VPS_DIR/.env"
 DATA_VOLUME=openmausbot_data
 BACKUP_DIR=/var/backups/openmausbot
+STATUS_FILE="$VPS_DIR/status/deploy.json"
+LOCK_FILE=/run/lock/openmausbot.lock
 
 usage() {
   cat <<'EOF'
@@ -14,6 +16,8 @@ usage: deploy/vps/omb <command>
 
   up                 build the image from this checkout and start (or restart) the server
   update             back up, pull the checked-out branch, rebuild and restart
+  deploy             up, publishing the result at https://DOMAIN/.well-known/openmausbot-deploy.json
+  sync               deploy the branch's new commits, if any (update, published the same way)
   backup             stop briefly, archive all data to /var/backups/openmausbot, start again
   restore FILE       replace all data with a backup archive (asks first)
   status             containers, health, bot box state and the public address
@@ -61,12 +65,32 @@ cmd_up() {
   build
   start
   docker image prune -f >/dev/null
+  write_status ok ""
   cmd_status
+}
+
+write_status() {
+  local result="$1" log="$2" box
+  box="$(compose exec -T omb node dist-server/bot-box/box-check.js 2>/dev/null \
+    | sed -n 's/.*"passed":\([0-9]*\),"total":\([0-9]*\).*/\1\/\2/p' || true)"
+  install -d -m 0755 "$(dirname "$STATUS_FILE")"
+  RESULT="$result" LOG="$log" BOX="$box" COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD)" \
+    python3 -c 'import json, os, datetime; print(json.dumps({
+      "commit": os.environ["COMMIT"], "result": os.environ["RESULT"],
+      "botBox": os.environ["BOX"] or None, "log": os.environ["LOG"] or None,
+      "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}))' \
+    > "$STATUS_FILE.part"
+  chmod 0644 "$STATUS_FILE.part"
+  mv "$STATUS_FILE.part" "$STATUS_FILE"
 }
 
 cmd_backup() {
   need_env
   local keep stamp archive offsite port was_running=""
+  if ! docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
+    echo "backup: no data yet"
+    return 0
+  fi
   keep="$(env_get BACKUP_KEEP_DAYS)"
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   install -d -m 0700 "$BACKUP_DIR"
@@ -120,7 +144,23 @@ cmd_update() {
   need_env
   cmd_backup
   git -C "$REPO_DIR" pull --ff-only
-  cmd_up
+  exec "$VPS_DIR/omb" up
+}
+
+reported() {
+  local log status=0
+  log="$(mktemp)"
+  "$VPS_DIR/omb" "$@" 2>&1 | tee "$log" || status=$?
+  [ "$status" -eq 0 ] || write_status failed "$(tail -n 30 "$log")"
+  rm -f "$log"
+  return "$status"
+}
+
+cmd_sync() {
+  need_env
+  git -C "$REPO_DIR" fetch -q origin
+  [ "$(git -C "$REPO_DIR" rev-parse HEAD)" != "$(git -C "$REPO_DIR" rev-parse '@{u}')" ] || return 0
+  reported update
 }
 
 cmd_status() {
@@ -140,18 +180,31 @@ cmd_login() {
   esac
 }
 
-command="${1:-}"
-[ $# -gt 0 ] && shift
-case "$command" in
-  up) cmd_up ;;
-  update) cmd_update ;;
-  backup) cmd_backup ;;
-  restore) cmd_restore "$@" ;;
-  status) cmd_status ;;
-  logs) compose logs -f --tail 200 "$@" ;;
-  pair) compose exec omb node dist-server/openmausbot.js pair "$@" ;;
-  login) cmd_login "$@" ;;
-  box-check) compose exec omb node dist-server/bot-box/box-check.js ;;
-  exec) compose exec omb "$@" ;;
-  *) usage; [ -z "$command" ] || [ "$command" = help ] || exit 1 ;;
-esac
+lock() {
+  [ -n "${OMB_LOCKED:-}" ] && return 0
+  export OMB_LOCKED=1
+  exec 9>"$LOCK_FILE"
+  flock "$@" 9
+}
+
+main() {
+  local command="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$command" in
+    up) lock; cmd_up ;;
+    update) lock; cmd_update ;;
+    deploy) lock; reported up ;;
+    sync) lock -n || exit 0; cmd_sync ;;
+    backup) lock; cmd_backup ;;
+    restore) lock; cmd_restore "$@" ;;
+    status) cmd_status ;;
+    logs) compose logs -f --tail 200 "$@" ;;
+    pair) compose exec omb node dist-server/openmausbot.js pair "$@" ;;
+    login) cmd_login "$@" ;;
+    box-check) compose exec omb node dist-server/bot-box/box-check.js ;;
+    exec) compose exec omb "$@" ;;
+    *) usage; [ -z "$command" ] || [ "$command" = help ] || exit 1 ;;
+  esac
+}
+
+main "$@"; exit
