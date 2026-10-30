@@ -1,0 +1,22 @@
+# The deploy status is public on purpose: the running commit, the deploy result
+# and the bot box self-check count, so a deploy can be checked without a shell.
+{$DOMAIN} {
+	encode zstd gzip
+
+	handle /.well-known/openmausbot-deploy.json {
+		root * /srv/status
+		rewrite * /deploy.json
+		header Cache-Control no-store
+		file_server
+	}
+
+	handle /hooks/* {
+		reverse_proxy 127.0.0.1:8800
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:8799 {
+			flush_interval -1
+		}
+	}
+}

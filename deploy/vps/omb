@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# Operate the production OpenMausBot server on this VPS (deploy/vps/README.md).
+set -euo pipefail
+
+VPS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$VPS_DIR/../.." && pwd)"
+ENV_FILE="$VPS_DIR/.env"
+DATA_VOLUME=openmausbot_data
+BACKUP_DIR=/var/backups/openmausbot
+STATUS_FILE="$VPS_DIR/status/deploy.json"
+LOCK_FILE=/run/lock/openmausbot.lock
+
+usage() {
+  cat <<'EOF'
+usage: deploy/vps/omb <command>
+
+  up                 build the image from this checkout and start (or restart) the server
+  update             back up, pull the checked-out branch, rebuild and restart
+  deploy             up, publishing the result at https://DOMAIN/.well-known/openmausbot-deploy.json
+  sync               deploy the branch's new commits, if any (update, published the same way)
+  backup             stop briefly, archive all data to /var/backups/openmausbot, start again
+  restore FILE       replace all data with a backup archive (asks first)
+  status             containers, health, bot box state and the public address
+  logs [SERVICE]     follow logs (omb or caddy)
+  pair [ARGS]        mint a pairing code and link (e.g. --label "MacBook", --client)
+  login ENGINE       sign an engine in on the server (claude, codex)
+  box-check          run the bot box self-check
+  exec ARGS...       run a command in the server container
+EOF
+}
+
+env_get() {
+  [ -f "$ENV_FILE" ] || return 0
+  sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+}
+
+compose() {
+  docker compose --project-directory "$VPS_DIR" -f "$VPS_DIR/docker-compose.yml" "$@"
+}
+
+need_env() {
+  if [ ! -f "$ENV_FILE" ]; then
+    echo "missing $ENV_FILE: copy .env.example and set DOMAIN" >&2
+    exit 1
+  fi
+  if [ -z "$(env_get DOMAIN)" ] || [ "$(env_get DOMAIN)" = "maus.example.com" ]; then
+    echo "set DOMAIN in $ENV_FILE" >&2
+    exit 1
+  fi
+}
+
+build() {
+  need_env
+  docker build --pull --target server \
+    --build-arg ENGINES="$(env_get ENGINES)" \
+    -t openmausbot-server:local "$REPO_DIR"
+  compose build
+}
+
+start() {
+  compose up -d --wait --wait-timeout 300
+}
+
+cmd_up() {
+  build
+  start
+  docker image prune -f >/dev/null
+  write_status ok ""
+  cmd_status
+}
+
+write_status() {
+  local result="$1" log="$2" box
+  box="$(compose exec -T omb node dist-server/bot-box/box-check.js 2>/dev/null \
+    | sed -n 's/.*"passed":\([0-9]*\),"total":\([0-9]*\).*/\1\/\2/p' || true)"
+  install -d -m 0755 "$(dirname "$STATUS_FILE")"
+  RESULT="$result" LOG="$log" BOX="$box" COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD)" \
+    python3 -c 'import json, os, datetime; print(json.dumps({
+      "commit": os.environ["COMMIT"], "result": os.environ["RESULT"],
+      "botBox": os.environ["BOX"] or None, "log": os.environ["LOG"] or None,
+      "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}))' \
+    > "$STATUS_FILE.part"
+  chmod 0644 "$STATUS_FILE.part"
+  mv "$STATUS_FILE.part" "$STATUS_FILE"
+}
+
+cmd_backup() {
+  need_env
+  local keep stamp archive offsite port was_running=""
+  if ! docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
+    echo "backup: no data yet"
+    return 0
+  fi
+  keep="$(env_get BACKUP_KEEP_DAYS)"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  install -d -m 0700 "$BACKUP_DIR"
+  archive="$BACKUP_DIR/openmausbot-$stamp.tgz"
+  if compose ps --status running -q omb | grep -q .; then
+    was_running=1
+    trap start EXIT
+    compose stop
+  fi
+  docker run --rm --user root --entrypoint tar \
+    -v "$DATA_VOLUME":/data:ro -v "$BACKUP_DIR":/backup \
+    openmausbot-vps:local czf "/backup/openmausbot-$stamp.tgz.part" -C /data .
+  mv "$archive.part" "$archive"
+  chmod 0600 "$archive"
+  cp "$ENV_FILE" "$BACKUP_DIR/env-$stamp"
+  chmod 0600 "$BACKUP_DIR/env-$stamp"
+  if [ -n "$was_running" ]; then
+    trap - EXIT
+    start
+  fi
+  find "$BACKUP_DIR" -maxdepth 1 \( -name 'openmausbot-*.tgz' -o -name 'env-*' \) \
+    -mtime +"${keep:-14}" -delete
+  echo "backup: $archive ($(du -h "$archive" | cut -f1))"
+  offsite="$(env_get BACKUP_OFFSITE)"
+  if [ -n "$offsite" ]; then
+    port="$(env_get BACKUP_SSH_PORT)"
+    rsync -a --delete -e "ssh -p ${port:-22} -o BatchMode=yes" \
+      "$BACKUP_DIR"/ "$offsite"
+    echo "backup: copied to $offsite"
+  fi
+}
+
+cmd_restore() {
+  local archive="${1:-}"
+  if [ ! -f "$archive" ]; then
+    echo "usage: deploy/vps/omb restore /var/backups/openmausbot/openmausbot-....tgz" >&2
+    exit 1
+  fi
+  read -r -p "Replace ALL server data with $archive? Type yes: " answer
+  [ "$answer" = "yes" ] || exit 1
+  cmd_backup
+  compose stop
+  docker run --rm --user root --entrypoint sh \
+    -v "$DATA_VOLUME":/data -v "$(cd "$(dirname "$archive")" && pwd)":/backup:ro \
+    openmausbot-vps:local -c "find /data -mindepth 1 -delete && tar xzf '/backup/$(basename "$archive")' -C /data && chown -R maus:maus /data"
+  start
+  cmd_status
+}
+
+cmd_update() {
+  need_env
+  cmd_backup
+  git -C "$REPO_DIR" pull --ff-only
+  exec "$VPS_DIR/omb" up
+}
+
+reported() {
+  local log status=0
+  log="$(mktemp)"
+  "$VPS_DIR/omb" "$@" 2>&1 | tee "$log" || status=$?
+  [ "$status" -eq 0 ] || write_status failed "$(tail -n 30 "$log")"
+  rm -f "$log"
+  return "$status"
+}
+
+cmd_sync() {
+  need_env
+  git -C "$REPO_DIR" fetch -q origin
+  [ "$(git -C "$REPO_DIR" rev-parse HEAD)" != "$(git -C "$REPO_DIR" rev-parse '@{u}')" ] || return 0
+  reported update
+}
+
+cmd_status() {
+  compose ps
+  echo
+  compose exec -T omb node dist-server/openmausbot.js status 2>/dev/null || true
+  echo
+  echo "address: https://$(env_get DOMAIN)"
+}
+
+cmd_login() {
+  case "${1:-}" in
+    claude) compose exec omb claude ;;
+    codex) compose exec omb codex login --device-auth ;;
+    "") echo "usage: deploy/vps/omb login claude|codex" >&2; exit 1 ;;
+    *) compose exec omb "$@" ;;
+  esac
+}
+
+lock() {
+  [ -n "${OMB_LOCKED:-}" ] && return 0
+  export OMB_LOCKED=1
+  exec 9>"$LOCK_FILE"
+  flock "$@" 9
+}
+
+main() {
+  local command="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$command" in
+    up) lock; cmd_up ;;
+    update) lock; cmd_update ;;
+    deploy) lock; reported up ;;
+    sync) lock -n || exit 0; cmd_sync ;;
+    backup) lock; cmd_backup ;;
+    restore) lock; cmd_restore "$@" ;;
+    status) cmd_status ;;
+    logs) compose logs -f --tail 200 "$@" ;;
+    pair) compose exec omb node dist-server/openmausbot.js pair "$@" ;;
+    login) cmd_login "$@" ;;
+    box-check) compose exec omb node dist-server/bot-box/box-check.js ;;
+    exec) compose exec omb "$@" ;;
+    *) usage; [ -z "$command" ] || [ "$command" = help ] || exit 1 ;;
+  esac
+}
+
+main "$@"; exit

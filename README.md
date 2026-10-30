@@ -514,7 +514,9 @@ For a background service on a VPS or an always-on computer, use
 tailnet, or the Docker stack for your own domain. These are separate from
 AI-provider sign-in. Devices pair once with a short code. The deployment guide is
 [docs/deploy-vps.md](docs/deploy-vps.md); the reference is
-[docs/self-hosting.md](docs/self-hosting.md).
+[docs/self-hosting.md](docs/self-hosting.md). A hardened production setup with
+sandboxed bots, built from this repository, is in
+[deploy/vps](deploy/vps/README.md).
 
 ## License
 
